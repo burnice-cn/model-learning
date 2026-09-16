@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environment
+.venv/
+venv/
+uv.lock
+
+# Local model weights and Hugging Face cache
+models/
+.cache/
+hf_cache/
+
+# Generated images and model artifacts
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.safetensors
+*.gguf
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.msgpack
+
+# Experiment outputs
+output*/
+runs/
+wandb/
+logs/
+*.log
+*.jsonl.tmp
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Temporary files
+.tmp*
+tmp/
