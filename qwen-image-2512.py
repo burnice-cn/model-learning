@@ -1382,6 +1382,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="random seed; use -1 for a random seed",
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=12,
+        help="PyTorch CPU intra-op thread count; 12 is fastest in local microbenchmarks",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         default="output.png",
@@ -1404,6 +1410,17 @@ def main() -> None:
         raise SystemExit("--width and --height must be positive")
     if args.width % 16 or args.height % 16:
         raise SystemExit("--width and --height must be divisible by 16")
+    if args.threads <= 0:
+        raise SystemExit(f"--threads must be positive, got {args.threads}")
+
+    # The default PyTorch thread pool uses only 8 threads on this WSL2/i5-14400
+    # environment. Local GEMM microbenchmarks are fastest around 12 threads.
+    torch.set_num_threads(args.threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    torch.backends.mkldnn.enabled = True
 
     prompt = _resolve_prompt(args.prompt, args.prompt_file, DEFAULT_PROMPT, "prompt")
     if not prompt:
@@ -1438,6 +1455,7 @@ def main() -> None:
 
     print(f"Loading model: {model_path}")
     print("Device: cpu")
+    print(f"CPU threads: {args.threads}")
     print("Dtype: float32")
     if negative_prompt:
         print(f"Mode: disk-streaming, batched true CFG, scale {true_cfg_scale:g}")

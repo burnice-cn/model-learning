@@ -126,6 +126,7 @@ python qwen-image-2512.py \
 | `--height` | 必填 | 高度，必须能被 16 整除 |
 | `--steps` | 25 | 去噪步数，别名 `--num-inference-steps` |
 | `--seed` | 42 | 随机种子；`-1` 为随机 |
+| `--threads` | 12 | PyTorch CPU intra-op 线程数；本机 GEMM 微基准中 12 线程优于默认 8 线程；实际 1 步端到端收益约 2.5% |
 | `--output` | `output.png` | 输出图片 |
 | `--no-vae-tiling` | 关闭开关 | 默认启用 VAE tiling |
 
@@ -135,6 +136,7 @@ python qwen-image-2512.py \
 device = cpu
 dtype = float32
 mode = disk-streaming
+threads = 12
 prefetch = True
 ```
 
@@ -163,6 +165,7 @@ Building text_encoder with disk streaming...
 Building transformer with disk streaming...
 Loading model: /path/to/models/Qwen-Image-2512
 Device: cpu
+CPU threads: 12
 Dtype: float32
 Mode: disk-streaming, no true CFG
 Size: 512x512
