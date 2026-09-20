@@ -213,6 +213,21 @@ python qwen-image-2512.py \
 
 不传 `--negative-prompt` 时，脚本使用 `true_cfg_scale=1.0`，只做单路预测；传入负面提示词后，默认使用 `true_cfg_scale=4.0`，并把条件/无条件样本合成 batch=2，减少流式权重读取次数。
 
+脚本默认启用两类优化：
+
+- `.cache/qwen-image-prompts/` 缓存精确 prompt embedding；同一 prompt 重复生成时不再重新流式读取 16GB 文本编码器。
+- `--cpu-cache-gib 6` 把最多约 6GiB 的 transformer 权重按磁盘原始精度保留在 RAM；命中时仍转换为 fp32，不改变输出。
+
+如需关闭或强制刷新：
+
+```bash
+--no-prompt-cache
+--refresh-prompt-cache
+--cpu-cache-gib 0
+```
+
+`--cfg-steps N` 是实验性速度/画质折中：只在前 N 步启用 true CFG，会改变最终图片；省略它则保持全量 CFG。
+
 > 注意：
 >
 > - 宽高必须是 16 的倍数。

@@ -28,6 +28,7 @@ Run against a local model directory:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import OrderedDict
@@ -36,6 +37,7 @@ import os
 import random
 import struct
 import sys
+import tempfile
 import threading
 import time
 from importlib.metadata import PackageNotFoundError, version
@@ -49,6 +51,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 try:
     from diffusers import QwenImagePipeline
@@ -260,7 +263,8 @@ class StreamingExecutor:
                  device: str | torch.device = "cpu",
                  cache_max_bytes: int = 0,
                  cache_reserve_bytes: int = 4 << 30,
-                 cache_policy: str = "prefix"):
+                 cache_policy: str = "prefix",
+                 cpu_cache_max_bytes: int = 0):
         self.model = model
         self.index = index
         self.dtype = dtype
@@ -275,6 +279,14 @@ class StreamingExecutor:
         self.cache_enabled = self.cache_max_bytes > 0 and self.device.type == "cuda"
         self._gpu_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         self._gpu_cache_bytes = 0
+
+        # CPU cache keeps the checkpoint's original dtype (normally bf16). On a hit,
+        # tensors are converted to the requested fp32 dtype exactly as a fresh disk
+        # read would be, so the forward result remains bit-for-bit unchanged.
+        self.cpu_cache_max_bytes = max(0, int(cpu_cache_max_bytes))
+        self.cpu_cache_enabled = self.cpu_cache_max_bytes > 0 and self.device.type == "cpu"
+        self._cpu_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._cpu_cache_bytes = 0
         self._active_tensors: dict[str, dict[str, torch.Tensor]] = {}
 
         self._named = dict(model.named_modules())
@@ -292,10 +304,9 @@ class StreamingExecutor:
         self.stats = {
             "block_calls": 0, "steps": 0,
             "sync_loads": 0, "prefetch_hits": 0, "cache_hits": 0,
-            "bytes_read": 0, "load_seconds": 0.0,
-            "block_table": {},
-            "peak_rss_mb": 0.0,
-            "gpu_cache_bytes": 0,
+            "cpu_cache_hits": 0, "bytes_read": 0, "load_seconds": 0.0,
+            "block_table": {}, "peak_rss_mb": 0.0,
+            "gpu_cache_bytes": 0, "cpu_cache_bytes": 0,
         }
 
         blocks, residents = plan_blocks(model, index, resident_max_bytes, split_max_bytes)
@@ -426,6 +437,33 @@ class StreamingExecutor:
             self.stats["gpu_cache_bytes"] = self._gpu_cache_bytes
         return tensors
 
+    def _store_cpu_cache(self, block: str, tensors: dict[str, torch.Tensor]) -> None:
+        if not self.cpu_cache_enabled or block in self._cpu_cache:
+            return
+        size = sum(self.index.size_bytes(name) for name in tensors)
+        if size > self.cpu_cache_max_bytes:
+            return
+        # Prefix policy: keep the first blocks that fit. LRU is pathological for a
+        # cyclic transformer pass larger than RAM; it evicts exactly the blocks that
+        # will be needed next round. A stable prefix guarantees those hits instead.
+        with self._lock:
+            if self._cpu_cache_bytes + size > self.cpu_cache_max_bytes:
+                return
+            self._cpu_cache[block] = tensors
+            self._cpu_cache_bytes += size
+            self.stats["cpu_cache_bytes"] = self._cpu_cache_bytes
+
+    def _peek_cpu_cache(self, block: str) -> dict[str, torch.Tensor] | None:
+        """Return cached source tensors without eviction.
+
+        Unlike a demand-pop cache, the prefix must survive each transformer pass;
+        otherwise a block would only hit every other step round.
+        """
+        if not self.cpu_cache_enabled:
+            return None
+        with self._lock:
+            return self._cpu_cache.get(block)
+
     # ---------- 块生命周期 ----------
 
     def _on_enter_block(self, block: str):
@@ -471,16 +509,26 @@ class StreamingExecutor:
 
     # ---------- 加载 / 预取 ----------
 
-    def _load_tensors(self, param_names, count_stats=True):
+    def _load_tensors(
+        self,
+        param_names,
+        count_stats=True,
+        cache_block: str | None = None,
+    ):
         tensors = {}
+        source_tensors = {}
         nbytes = 0
         t0 = time.perf_counter()
         for name in param_names:
-            t = self.index.read(name)
+            source = self.index.read(name)
+            source_tensors[name] = source
+            t = source
             if t.dtype != self.dtype or t.device != self.device:
                 t = t.to(device=self.device, dtype=self.dtype)
             tensors[name] = t
             nbytes += self.index.size_bytes(name)
+        if cache_block is not None and self.cpu_cache_enabled:
+            self._store_cpu_cache(cache_block, source_tensors)
         dt = time.perf_counter() - t0
         if count_stats:
             self.stats["bytes_read"] += nbytes
@@ -489,7 +537,7 @@ class StreamingExecutor:
 
     def _load_block(self, block: str):
         t0 = time.perf_counter()
-        tensors = self._load_tensors(self._block_params[block])
+        tensors = self._load_tensors(self._block_params[block], cache_block=block)
         dt = time.perf_counter() - t0
         self.stats["block_table"].setdefault(block, {
             "mb": sum(self.index.size_bytes(n) for n in self._block_params[block]) / 1e6,
@@ -533,7 +581,29 @@ class StreamingExecutor:
             self.stats["block_table"][block]["hits"] += 1
             return cached
 
-        # 3) 未命中 → 同步加载
+        # 3) CPU LRU cache hit. The cache stores checkpoint-dtype tensors and casts
+        # them here; this is numerically equivalent to casting a fresh disk read.
+        cached = self._peek_cpu_cache(block)
+        if cached is not None:
+            t0 = time.perf_counter()
+            tensors = {
+                name: (
+                    tensor
+                    if tensor.dtype == self.dtype and tensor.device == self.device
+                    else tensor.to(device=self.device, dtype=self.dtype)
+                )
+                for name, tensor in cached.items()
+            }
+            self.stats["cpu_cache_hits"] += 1
+            self.stats["load_seconds"] += time.perf_counter() - t0
+            self.stats["block_table"].setdefault(block, {
+                "mb": sum(self.index.size_bytes(n) for n in self._block_params[block]) / 1e6,
+                "loads": 0, "seconds": 0.0, "hits": 0,
+            })
+            self.stats["block_table"][block]["hits"] += 1
+            return tensors
+
+        # 4) 未命中 → 同步加载
         self.stats["sync_loads"] += 1
         tensors = self._load_block(block)
         if self.verbose and self.stats["block_calls"] < len(self._blocks):
@@ -552,12 +622,19 @@ class StreamingExecutor:
                 return
             # 回绕预取：最后一个块之后预取第一个块（下一轮前向）
             nxt = self._order[(self._ptr + 1) % len(self._order)]
-            if nxt in self._staged or nxt in self._loaded or nxt in self._gpu_cache:
+            if (
+                nxt in self._staged
+                or nxt in self._loaded
+                or nxt in self._gpu_cache
+                or nxt in self._cpu_cache
+            ):
                 return
 
             def worker(name=nxt):
                 t0 = time.perf_counter()
-                tensors = self._load_tensors(self._block_params[name])
+                tensors = self._load_tensors(
+                    self._block_params[name], cache_block=name
+                )
                 with self._lock:
                     self._staged[name] = tensors
                     self.stats["block_table"].setdefault(name, {
@@ -586,6 +663,8 @@ class StreamingExecutor:
             f"流式块数: {len(self._blocks)}  常驻块数: {len(self._residents)}",
             f"块前向次数: {s['block_calls']}（约 {s['steps'] + 1} 轮完整前向）",
             f"预取命中: {s['prefetch_hits']}  同步加载(未命中): {s['sync_loads']}",
+            f"GPU缓存命中: {s['cache_hits']}  CPU缓存命中: {s['cpu_cache_hits']}",
+            f"CPU缓存当前: {s['cpu_cache_bytes']/1024**3:.2f} GiB",
             f"磁盘读取总量: {s['bytes_read']/1e9:.2f} GB"
             f"（{s['bytes_read']/max(s['steps'] + 1, 1)/1e9:.2f} GB/轮前向）",
             f"累计加载耗时: {s['load_seconds']:.2f}s",
@@ -715,6 +794,7 @@ def build_transformer_streaming(
     cache_max_bytes: int = 0,
     cache_reserve_bytes: int = 4 << 30,
     cache_policy: str = "prefix",
+    cpu_cache_max_bytes: int = 0,
 ):
     from diffusers import QwenImageTransformer2DModel
     root = Path(model_dir).expanduser().resolve()
@@ -727,6 +807,7 @@ def build_transformer_streaming(
         cache_max_bytes=cache_max_bytes,
         cache_reserve_bytes=cache_reserve_bytes,
         cache_policy=cache_policy,
+        cpu_cache_max_bytes=cpu_cache_max_bytes,
     )
     info = fix_qwen_embed_rope(tr, device=device)
     print(f"[transformer] RoPE 频率表重算: {info}")
@@ -794,6 +875,213 @@ def _resolve_prompt(
             raise SystemExit(f"{option_name} file is empty: {file_path}")
         return text
     return inline if inline is not None else default
+
+
+
+_PROMPT_CACHE_FORMAT = 1
+# Preserve the two historical code paths exactly:
+# - official no-CFG pipeline call: 512
+# - custom batched true-CFG path: encode_prompt's default, 1024
+_NO_CFG_PROMPT_MAX_SEQUENCE_LENGTH = 512
+_CFG_PROMPT_MAX_SEQUENCE_LENGTH = 1024
+
+
+def _package_version_for_cache(package: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "missing"
+
+
+def _prompt_cache_key(
+    model_path: Path,
+    prompt: str,
+    dtype: torch.dtype,
+    max_sequence_length: int,
+) -> str:
+    """Build a conservative cache key for one Qwen prompt embedding.
+
+    Hashing the 16GB text-encoder shards on every run would itself cost minutes, so
+    this key uses shard metadata plus the full contents of small files that affect
+    tokenization/model construction. Replacing or touching a shard invalidates it.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"qwen-image-prompt-cache\0")
+    digest.update(f"format={_PROMPT_CACHE_FORMAT}\0".encode())
+    digest.update(f"dtype={dtype}\0".encode())
+    digest.update(f"max_sequence_length={max_sequence_length}\0".encode())
+    for package in ("torch", "transformers", "diffusers", "tokenizers"):
+        digest.update(f"{package}={_package_version_for_cache(package)}\0".encode())
+
+    for path in sorted((model_path / "text_encoder").glob("*.safetensors")):
+        stat = path.stat()
+        digest.update(f"weight:{path.name}:{stat.st_size}:{stat.st_mtime_ns}\0".encode())
+    for relative in (
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/model.safetensors.index.json",
+    ):
+        path = model_path / relative
+        if path.is_file():
+            digest.update(f"file:{relative}:".encode())
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+
+    tokenizer_dir = model_path / "tokenizer"
+    if tokenizer_dir.is_dir():
+        for path in sorted(tokenizer_dir.iterdir()):
+            if path.is_file():
+                digest.update(f"tokenizer:{path.name}:".encode())
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
+
+    digest.update(b"prompt\0")
+    digest.update(prompt.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _load_prompt_embedding_cache(
+    cache_path: Path,
+    cache_key: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        with safe_open(str(cache_path), framework="pt") as cached:
+            metadata = cached.metadata() or {}
+            if metadata.get("key") != cache_key:
+                return None
+            embeds = cached.get_tensor("embeds").to(device=device, dtype=dtype)
+            mask = cached.get_tensor("mask") if "mask" in cached.keys() else None
+        if mask is not None:
+            mask = mask.to(device=device)
+            if bool(mask.all()):
+                mask = None
+        if embeds.ndim != 3 or embeds.shape[0] != 1:
+            return None
+        if mask is not None and tuple(mask.shape) != tuple(embeds.shape[:2]):
+            return None
+        return embeds, mask
+    except (OSError, KeyError, RuntimeError, ValueError):
+        return None
+
+
+def _save_prompt_embedding_cache(
+    cache_path: Path,
+    cache_key: str,
+    embeds: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> None:
+    """Atomically save exact tensors; cache failures never stop generation."""
+    payload = {
+        "embeds": embeds.detach().to(device="cpu", dtype=embeds.dtype).contiguous(),
+    }
+    if mask is None:
+        payload["mask"] = torch.ones(embeds.shape[:2], dtype=torch.int64, device="cpu")
+    else:
+        payload["mask"] = mask.detach().to(device="cpu").contiguous()
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{cache_path.name}.", suffix=".tmp", dir=cache_path.parent
+        )
+        os.close(fd)
+        temporary_path = Path(temporary_name)
+        try:
+            save_file(
+                payload,
+                str(temporary_path),
+                metadata={"format": str(_PROMPT_CACHE_FORMAT), "key": cache_key},
+            )
+            os.replace(temporary_path, cache_path)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        print(f"Warning: could not write prompt cache {cache_path}: {exc}")
+
+
+def _get_prompt_embeddings(
+    pipe: QwenImagePipeline,
+    model_path: Path,
+    prompt: str,
+    negative_prompt: str | None,
+    cache_dir: Path,
+    cache_enabled: bool,
+    refresh_cache: bool,
+    dtype: torch.dtype,
+    max_sequence_length: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Load or encode exact prompt embeddings, with one cache entry per prompt.
+
+    The cache is lossless in the inference sense: it stores the exact tensors returned
+    by ``pipe.encode_prompt`` and reloads them without re-running the text encoder.
+    """
+    device = pipe._execution_device
+    prompts = [prompt] + ([negative_prompt] if negative_prompt else [])
+    labels = ["prompt", "negative-prompt"]
+    entries: list[tuple[torch.Tensor, torch.Tensor | None] | None] = []
+    cache_paths: list[Path] = []
+    cache_keys: list[str] = []
+
+    for text in prompts:
+        key = _prompt_cache_key(model_path, text, dtype, max_sequence_length)
+        path = cache_dir / f"{key}.safetensors"
+        cache_keys.append(key)
+        cache_paths.append(path)
+        entries.append(
+            None
+            if refresh_cache or not cache_enabled
+            else _load_prompt_embedding_cache(path, key, device, dtype)
+        )
+
+    missing_indices = [i for i, entry in enumerate(entries) if entry is None]
+    if not cache_enabled:
+        status = "disabled"
+    else:
+        status = ", ".join(
+            f"{labels[i]} {'miss' if i in missing_indices else 'hit'}"
+            for i in range(len(prompts))
+        )
+    print(f"Prompt embedding cache: {status}")
+
+    if missing_indices:
+        encoded_embeds, encoded_mask = pipe.encode_prompt(
+            prompt=[prompts[i] for i in missing_indices],
+            device=device,
+            max_sequence_length=max_sequence_length,
+        )
+        for local_index, prompt_index in enumerate(missing_indices):
+            embeds = encoded_embeds[local_index : local_index + 1]
+            mask = None
+            if encoded_mask is not None:
+                mask = encoded_mask[local_index : local_index + 1]
+            entries[prompt_index] = (embeds, mask)
+            if cache_enabled:
+                _save_prompt_embedding_cache(
+                    cache_paths[prompt_index], cache_keys[prompt_index], embeds, mask
+                )
+
+    prompt_entry = entries[0]
+    assert prompt_entry is not None
+    prompt_embeds, prompt_mask = prompt_entry
+    if negative_prompt:
+        negative_entry = entries[1]
+        assert negative_entry is not None
+        negative_embeds, negative_mask = negative_entry
+    else:
+        negative_embeds, negative_mask = None, None
+    return prompt_embeds, prompt_mask, negative_embeds, negative_mask
 
 
 def _resolve_size(args: argparse.Namespace) -> tuple[int, int]:
@@ -940,6 +1228,7 @@ def _build_streaming_pipeline(
     cache_max_bytes: int,
     cache_reserve_bytes: int,
     cache_policy: str,
+    cpu_cache_max_bytes: int,
 ) -> QwenImagePipeline:
     """Build text_encoder/transformer as meta models and stream one disk block at a time."""
     print("Building text_encoder with disk streaming...")
@@ -964,6 +1253,7 @@ def _build_streaming_pipeline(
         cache_max_bytes=cache_max_bytes,
         cache_reserve_bytes=cache_reserve_bytes,
         cache_policy=cache_policy,
+        cpu_cache_max_bytes=cpu_cache_max_bytes,
     )
 
     # Passing the two large components prevents from_pretrained from loading their
@@ -1012,49 +1302,46 @@ def _pad_prompt_embedding(
 @torch.no_grad()
 def _generate_with_batched_true_cfg(
     pipe: QwenImagePipeline,
-    prompt: str,
-    negative_prompt: str,
+    prompt_embeds: torch.Tensor,
+    prompt_embeds_mask: torch.Tensor | None,
+    negative_prompt_embeds: torch.Tensor,
+    negative_prompt_embeds_mask: torch.Tensor | None,
     true_cfg_scale: float,
     height: int,
     width: int,
     num_inference_steps: int,
     generator: torch.Generator,
+    cfg_steps: int | None = None,
 ):
     """Generate with cond/uncond packed into one batch-2 transformer call.
 
-    Diffusers' stock QwenImagePipeline runs cond and uncond as two separate transformer
-    forwards. With disk streaming that means every denoising step reads the 40.9GB
-    transformer checkpoint twice. Packing both conditions into one batch halves the
-    weight-streaming I/O per step and substantially raises GPU utilization.
+    ``cfg_steps`` is an experimental speed knob. When omitted, every step uses true
+    CFG and the result matches the script's previous full-CFG behaviour. When set to
+    a smaller value, only the first ``cfg_steps`` denoising steps run CFG; remaining
+    steps use the positive prompt only. This changes the image and is not lossless.
     """
     from diffusers.pipelines.qwenimage.pipeline_qwenimage import (
         calculate_shift,
         retrieve_timesteps,
     )
 
-    if true_cfg_scale <= 1.0 or not negative_prompt:
+    if cfg_steps is None:
+        cfg_steps = num_inference_steps
+    if cfg_steps < 0 or cfg_steps > num_inference_steps:
+        raise SystemExit(
+            f"--cfg-steps must be between 0 and --steps ({num_inference_steps}), got {cfg_steps}"
+        )
+    if cfg_steps and (true_cfg_scale <= 1.0 or negative_prompt_embeds is None):
         raise SystemExit("batched true CFG requires a negative prompt and true_cfg_scale > 1")
 
     device = pipe._execution_device
-    # Encode positive and negative prompts together. This also streams the 16.6GB
-    # text_encoder checkpoint once instead of twice during startup.
-    all_embeds, all_mask = pipe.encode_prompt(
-        prompt=[prompt, negative_prompt],
-        device=device,
+    max_prompt_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
+    prompt_embeds, prompt_mask = _pad_prompt_embedding(
+        prompt_embeds, prompt_embeds_mask, max_prompt_len
     )
-    prompt_embeds, negative_embeds = all_embeds.chunk(2, dim=0)
-    if all_mask is None:
-        prompt_mask = None
-        negative_mask = None
-    else:
-        prompt_mask = all_mask[:1]
-        negative_mask = all_mask[1:2]
-
-    max_prompt_len = max(prompt_embeds.shape[1], negative_embeds.shape[1])
-    prompt_embeds, prompt_mask = _pad_prompt_embedding(prompt_embeds, prompt_mask, max_prompt_len)
     negative_embeds, negative_mask = _pad_prompt_embedding(
-        negative_embeds,
-        negative_mask,
+        negative_prompt_embeds,
+        negative_prompt_embeds_mask,
         max_prompt_len,
     )
     batched_embeds = torch.cat([prompt_embeds, negative_embeds], dim=0)
@@ -1070,13 +1357,14 @@ def _generate_with_batched_true_cfg(
         device,
         generator,
     )
-    img_shapes = [[
+    one_img_shape = [[
         (
             1,
             height // pipe.vae_scale_factor // 2,
             width // pipe.vae_scale_factor // 2,
         )
-    ]] * 2
+    ]]
+    img_shapes = one_img_shape * 2
 
     sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
     image_seq_len = latents.shape[1]
@@ -1110,36 +1398,54 @@ def _generate_with_batched_true_cfg(
     pipe._current_timestep = None
     pipe._interrupt = False
 
-    print("Using batched true CFG: cond + uncond in one transformer forward per step")
+    mode = (
+        "batched true CFG on every step"
+        if cfg_steps == num_inference_steps
+        else f"experimental partial CFG: {cfg_steps}/{num_inference_steps} steps"
+    )
+    print(f"Using {mode}: cond + uncond share one transformer forward on CFG steps")
+    if cfg_steps != num_inference_steps:
+        print("Warning: partial CFG changes the denoising trajectory and is not lossless.")
     transformer_executor = getattr(pipe, "_qwen_streaming_executors", (None, None))[1]
     with pipe.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
             step_start = time.perf_counter()
             pipe._current_timestep = t
-            timestep = t.expand(2).to(latents.dtype)
-            batched_latents = torch.cat([latents, latents], dim=0)
+            use_cfg = i < cfg_steps
 
-            # One cache context is sufficient for the packed batch. The stock pipeline
-            # only uses separate contexts because it performs two separate calls.
             with pipe.transformer.cache_context("cond"):
-                batched_prediction = pipe.transformer(
-                    hidden_states=batched_latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=batched_mask,
-                    encoder_hidden_states=batched_embeds,
-                    img_shapes=img_shapes,
-                    attention_kwargs=pipe._attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-            noise_pred, negative_noise_pred = batched_prediction.chunk(2, dim=0)
-            combined = negative_noise_pred + true_cfg_scale * (
-                noise_pred - negative_noise_pred
-            )
-            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-            combined_norm = torch.norm(combined, dim=-1, keepdim=True)
-            noise_pred = combined * (cond_norm / combined_norm)
+                if use_cfg:
+                    timestep = t.expand(2).to(latents.dtype)
+                    batched_latents = torch.cat([latents, latents], dim=0)
+                    prediction = pipe.transformer(
+                        hidden_states=batched_latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=batched_mask,
+                        encoder_hidden_states=batched_embeds,
+                        img_shapes=img_shapes,
+                        attention_kwargs=pipe._attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    noise_pred, negative_noise_pred = prediction.chunk(2, dim=0)
+                    combined = negative_noise_pred + true_cfg_scale * (
+                        noise_pred - negative_noise_pred
+                    )
+                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                    combined_norm = torch.norm(combined, dim=-1, keepdim=True)
+                    noise_pred = combined * (cond_norm / combined_norm)
+                else:
+                    timestep = t.expand(1).to(latents.dtype)
+                    noise_pred = pipe.transformer(
+                        hidden_states=latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=prompt_mask,
+                        encoder_hidden_states=prompt_embeds,
+                        img_shapes=one_img_shape,
+                        attention_kwargs=pipe._attention_kwargs,
+                        return_dict=False,
+                    )[0]
 
             latents_dtype = latents.dtype
             latents = pipe.scheduler.step(
@@ -1156,13 +1462,15 @@ def _generate_with_batched_true_cfg(
                 cache_stats = transformer_executor.stats
                 print(
                     f"[step {i + 1}/{num_inference_steps}] done in {step_elapsed:.1f}s, "
+                    f"CFG {'on' if use_cfg else 'off'}, "
                     f"cache hits {cache_stats['cache_hits']}, "
                     f"resident {cache_stats['gpu_cache_bytes'] / 1024**3:.2f} GiB",
                     flush=True,
                 )
             else:
                 print(
-                    f"[step {i + 1}/{num_inference_steps}] done in {step_elapsed:.1f}s",
+                    f"[step {i + 1}/{num_inference_steps}] done in {step_elapsed:.1f}s, "
+                    f"CFG {'on' if use_cfg else 'off'}",
                     flush=True,
                 )
 
@@ -1356,6 +1664,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="true CFG strength; defaults to 4.0 with a negative prompt, otherwise 1.0",
     )
     parser.add_argument(
+        "--cfg-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "experimental speed/quality trade-off: use true CFG only for the first N steps; "
+            "omit it to keep full CFG on every step (lossless relative to current behaviour)"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-cache-dir",
+        default=".cache/qwen-image-prompts",
+        help="directory for exact prompt-embedding caches",
+    )
+    parser.add_argument(
+        "--no-prompt-cache",
+        action="store_true",
+        help="do not read or write prompt-embedding caches",
+    )
+    parser.add_argument(
+        "--refresh-prompt-cache",
+        action="store_true",
+        help="recompute and overwrite prompt-embedding caches for this run",
+    )
+    parser.add_argument(
         "--width",
         type=int,
         required=True,
@@ -1388,6 +1721,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="PyTorch CPU intra-op thread count; 12 is fastest in local microbenchmarks",
     )
     parser.add_argument(
+        "--cpu-cache-gib",
+        type=float,
+        default=6.0,
+        metavar="GIB",
+        help=(
+            "experimental exact-speed optimization: keep up to GIB GiB of transformer "
+            "checkpoint-dtype blocks in RAM; 0 disables it (6 is a safe start on a 19 GiB machine)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         "-o",
         default="output.png",
@@ -1402,6 +1745,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    run_start = time.perf_counter()
     args = build_arg_parser().parse_args()
 
     if args.steps <= 0:
@@ -1412,6 +1756,15 @@ def main() -> None:
         raise SystemExit("--width and --height must be divisible by 16")
     if args.threads <= 0:
         raise SystemExit(f"--threads must be positive, got {args.threads}")
+    if args.cpu_cache_gib < 0:
+        raise SystemExit("--cpu-cache-gib must be non-negative")
+    if args.cfg_steps is not None and not (0 <= args.cfg_steps <= args.steps):
+        raise SystemExit(f"--cfg-steps must be between 0 and --steps ({args.steps})")
+    cfg_steps = args.steps if args.cfg_steps is None else args.cfg_steps
+    if cfg_steps > 0 and not (
+        args.negative_prompt or args.negative_prompt_file
+    ):
+        raise SystemExit("--cfg-steps > 0 requires a negative prompt")
 
     # The default PyTorch thread pool uses only 8 threads on this WSL2/i5-14400
     # environment. Local GEMM microbenchmarks are fastest around 12 threads.
@@ -1432,16 +1785,17 @@ def main() -> None:
         "",
         "negative-prompt",
     )
+    use_true_cfg = bool(negative_prompt) and cfg_steps > 0
     if args.true_cfg_scale is None:
-        true_cfg_scale = 4.0 if negative_prompt else 1.0
+        true_cfg_scale = 4.0 if use_true_cfg else 1.0
     else:
         true_cfg_scale = args.true_cfg_scale
         if not math.isfinite(true_cfg_scale) or true_cfg_scale <= 0:
             raise SystemExit("--true-cfg-scale must be a positive finite number")
-    if negative_prompt and true_cfg_scale <= 1.0:
-        raise SystemExit("--true-cfg-scale must be greater than 1 when a negative prompt is provided")
-    if not negative_prompt and true_cfg_scale != 1.0:
-        raise SystemExit("--true-cfg-scale greater than 1 requires --negative-prompt or --negative-prompt-file")
+    if use_true_cfg and true_cfg_scale <= 1.0:
+        raise SystemExit("--true-cfg-scale must be greater than 1 when true CFG is enabled")
+    if not use_true_cfg and true_cfg_scale != 1.0:
+        raise SystemExit("--true-cfg-scale greater than 1 requires a negative prompt and --cfg-steps > 0")
 
     width, height = _resolve_size(args)
     output_path = _normalise_output_path(args.output)
@@ -1457,12 +1811,22 @@ def main() -> None:
     print("Device: cpu")
     print(f"CPU threads: {args.threads}")
     print("Dtype: float32")
-    if negative_prompt:
+    if args.cpu_cache_gib:
+        print(
+            f"Experimental exact CPU weight cache: up to {args.cpu_cache_gib:g} GiB "
+            "(checkpoint-dtype blocks; cast to fp32 on each hit)"
+        )
+    if use_true_cfg:
         print(f"Mode: disk-streaming, batched true CFG, scale {true_cfg_scale:g}")
     else:
         print("Mode: disk-streaming, no true CFG")
     print(f"Size: {width}x{height}")
     print(f"Steps: {args.steps}, seed: {seed}")
+    if args.cfg_steps is not None:
+        print(
+            f"Experimental CFG schedule: {args.cfg_steps}/{args.steps} steps "
+            "(changes output; not lossless)"
+        )
     print(f"Output: {output_path}")
 
     pipe = _build_streaming_pipeline(
@@ -1474,31 +1838,64 @@ def main() -> None:
         cache_max_bytes=0,
         cache_reserve_bytes=0,
         cache_policy="prefix",
+        cpu_cache_max_bytes=int(args.cpu_cache_gib * 1024**3),
     )
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    if negative_prompt:
+    prompt_embeds, prompt_mask, negative_embeds, negative_mask = _get_prompt_embeddings(
+        pipe=pipe,
+        model_path=model_path,
+        prompt=prompt,
+        negative_prompt=negative_prompt if use_true_cfg else None,
+        cache_dir=Path(args.prompt_cache_dir).expanduser(),
+        cache_enabled=not args.no_prompt_cache,
+        refresh_cache=args.refresh_prompt_cache,
+        dtype=torch.float32,
+        max_sequence_length=(
+            _CFG_PROMPT_MAX_SEQUENCE_LENGTH
+            if negative_prompt
+            else _NO_CFG_PROMPT_MAX_SEQUENCE_LENGTH
+        ),
+    )
+    if use_true_cfg:
         image = _generate_with_batched_true_cfg(
             pipe=pipe,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_mask,
+            negative_prompt_embeds=negative_embeds,
+            negative_prompt_embeds_mask=negative_mask,
             true_cfg_scale=true_cfg_scale,
             height=height,
             width=width,
             num_inference_steps=args.steps,
             generator=generator,
+            cfg_steps=args.cfg_steps,
         )
     else:
         image = pipe(
-            prompt=prompt,
+            prompt=None,
             negative_prompt=None,
+            true_cfg_scale=1.0,
             width=width,
             height=height,
             num_inference_steps=args.steps,
-            true_cfg_scale=1.0,
             generator=generator,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_mask,
+            max_sequence_length=max_sequence_length,
         ).images[0]
     image.save(output_path)
+    transformer_executor = getattr(pipe, "_qwen_streaming_executors", (None, None))[1]
+    if transformer_executor is not None:
+        stats = transformer_executor.stats
+        print(
+            "Transformer stats: "
+            f"{stats['block_calls']} block forwards, "
+            f"{stats['cpu_cache_hits']} CPU cache hits, "
+            f"{stats['bytes_read'] / 1024**3:.2f} GiB disk reads, "
+            f"{stats['load_seconds']:.1f}s load/cast time"
+        )
     print(f"Saved image to: {output_path}")
+    print(f"Total wall time: {time.perf_counter() - run_start:.1f}s")
 
 
 if __name__ == "__main__":

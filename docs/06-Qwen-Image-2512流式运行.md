@@ -112,6 +112,55 @@ python qwen-image-2512.py \
 - 没有负面提示词时，不能设置大于 `1.0` 的 `true_cfg_scale`；
 - `--negative-prompt` 与 `--negative-prompt-file` 只能二选一。
 
+### 2.6 精确提示词缓存
+
+脚本默认把 prompt embedding 缓存在 `.cache/qwen-image-prompts/`。缓存保存的是文本编码器输出的精确张量；命中后不会重新流式读取 16GB 文本编码器权重，也不改变去噪结果。
+
+```bash
+# 第一次运行会写入缓存；同一 prompt 后续运行直接命中
+python qwen-image-2512.py \
+  --width 512 --height 512 --steps 8 \
+  --prompt-file prompt.txt \
+  --output cached-prompt.png
+```
+
+相关参数：
+
+```bash
+--prompt-cache-dir .cache/qwen-image-prompts  # 缓存目录
+--no-prompt-cache                            # 本次运行完全禁用
+--refresh-prompt-cache                       # 强制重算并覆盖
+```
+
+缓存键包含模型分片元数据、tokenizer/config 内容、PyTorch/Transformers/Diffusers 版本、dtype、最大文本长度和 prompt。模型文件或依赖变化后会自动失效。为了保持原行为，无 CFG 路径使用 512，true-CFG 路径使用 1024，两者会生成不同缓存条目。
+
+### 2.7 CPU 权重前缀缓存
+
+`--cpu-cache-gib` 默认为 6，表示最多把约 6GiB 的 transformer 权重按磁盘上的 bf16 原始精度保留在 RAM 中。命中时仍然转换为 fp32 再计算，因此结果与重新从磁盘读取并转换等价，属于无损提速实验。
+
+```bash
+# 19GiB 内存机器的保守起点
+--cpu-cache-gib 6
+```
+
+可以按 4、6、8GiB 做对比。如果出现 swap 或 RSS 接近物理内存，降低该值；如果内存仍有大量余量，可以逐步提高。该缓存采用“前缀策略”：保留第一轮先加载的块，避免 LRU 在循环读取大模型时把下一步最需要的块全部挤出去。
+
+### 2.8 实验性部分 CFG
+
+`--cfg-steps N` 只在前 N 个去噪步启用 true CFG，后续步骤只跑正向条件。它可能显著减少耗时，但会改变去噪轨迹和最终图片，不能称为无损优化。
+
+```bash
+# 前 10 步 CFG，后 40 步单路；仅用于速度/画质实验
+python qwen-image-2512.py \
+  --width 512 --height 512 --steps 50 \
+  --prompt-file prompt.txt \
+  --negative-prompt-file negative_prompt.txt \
+  --cfg-steps 10 \
+  --output partial-cfg.png
+```
+
+省略 `--cfg-steps` 时保持全量 CFG，与原行为一致。`--cfg-steps 0` 表示完全关闭 CFG；即使提供了负面提示词，也不会编码或使用它。
+
 ## 3. 参数说明
 
 | 参数 | 默认值 | 说明 |
@@ -122,6 +171,11 @@ python qwen-image-2512.py \
 | `--negative-prompt` | 无 | 负面提示词；提供后启用 batched true CFG |
 | `--negative-prompt-file` | 无 | 从 UTF-8 文件或 stdin 读取负面提示词 |
 | `--true-cfg-scale` | 条件默认 | 无负面提示词时为 `1.0`；有负面提示词时默认 `4.0` |
+| `--cfg-steps` | 无 | 实验性：只在前 N 步启用 CFG；会改变输出 |
+| `--prompt-cache-dir` | `.cache/qwen-image-prompts` | 精确 prompt embedding 缓存目录 |
+| `--no-prompt-cache` | 关闭开关 | 不读写 prompt embedding 缓存 |
+| `--refresh-prompt-cache` | 关闭开关 | 强制重算 prompt embedding 缓存 |
+| `--cpu-cache-gib` | 6 | 实验性：最多保留 6GiB 原始精度 transformer 权重在 RAM；0 关闭 |
 | `--width` | 必填 | 宽度，必须能被 16 整除 |
 | `--height` | 必填 | 高度，必须能被 16 整除 |
 | `--steps` | 25 | 去噪步数，别名 `--num-inference-steps` |
@@ -366,9 +420,13 @@ Qwen 的 latent/patch 计算使得注意力规模随面积增长。512×512 尚�
 
 ### 每步权重 I/O
 
-不做缓存时，每个 transformer step 都要重新读取权重。当前脚本使用预取，但权重不会长期留在 RAM。因此它牺牲速度换取可运行性。
+不做缓存时，每个 transformer step 都要重新读取权重。当前脚本使用预取，并可通过 `--cpu-cache-gib` 把一部分原始精度权重保留在 RAM。该缓存不改变数值，但受内存容量限制，只能减少 I/O/转换开销，不能减少矩阵乘法和 attention 的计算量。
 
 启用 batched true CFG 后，同一 step 内条件/无条件共用一次权重读取；但 batch 变成 2，激活值和计算量会增加。
+
+### 1024 级别的量级判断
+
+512×512 到 1024×1024 时，图像 token 数约为 4 倍；线性层计算约 4 倍，attention 的增长更陡。保持 50 步和 true CFG 时，CPU 单步耗时会远高于 512 级别。当前机器上应先用 1 步 1024 建立实测基线，再决定是否继续研究本地方案；若目标是实用化 5 分钟内，后续路线应重点评估消费级 NVIDIA GPU、TensorRT/FP8 或 GGUF。
 
 ### 历史实测参考
 
