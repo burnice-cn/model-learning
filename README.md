@@ -234,6 +234,51 @@ python qwen-image-2512.py \
 > - `models/Qwen-Image-2512/` 必须已经下载完整；脚本使用本地文件，不会自动下载模型。
 > - CPU 流式推理每步可能需要几十秒到数分钟，建议先用 `--steps 2` 验证。
 
+### 9. 远程运行 Qwen-Image-2.1
+
+`qwen-image2.py` 面向约 22GiB GPU、24GiB CPU RAM 的远程环境，只加载本地模型目录，不会下载模型。脚本对全部模型组件使用 block-level 磁盘 group offload，按块把权重加载到 CUDA，避免 GPU 和主机内存同时被完整组件占满。请先使用你自己的下载源获取 `Qwen-Image-2.1`，然后通过 `--model` 指向该目录。首次运行前安装模型主页要求的依赖：
+
+```bash
+pip install "torch>=2.4.0" "transformers>=5.17" accelerate pillow
+pip uninstall -y diffusers
+pip install "diffusers @ git+https://github.com/huggingface/diffusers"
+```
+
+注意：不要只执行 `pip install diffusers`。当前 PyPI 的 `diffusers==0.40.0` 还不包含 `QwenImage21Pipeline`；必须安装 GitHub `main` 分支。
+
+文生图：
+
+```bash
+python qwen-image2.py \
+  --mode text-to-image \
+  --prompt "A neon shop sign that reads \"QWEN IMAGE 2.1\", rainy night, reflections on wet pavement" \
+  --aspect-ratio 16:9 \
+  --seed 42 \
+  --output qwen-image2-t2i.png
+```
+
+图像编辑：
+
+```bash
+python qwen-image2.py \
+  --mode image-edit \
+  --prompt "Change the background to a sunset beach" \
+  --aspect-ratio 1:1 \
+  --reference-image input.png \
+  --output qwen-image2-edit.png
+```
+
+说明：
+
+- `--mode` 默认是 `text-to-image`，可选 `image-edit`。
+- `--prompt` 默认为空。
+- `--aspect-ratio` 默认是 `1:1`，支持 `1:1`、`4:3`、`3:4`、`3:2`、`2:3`、`16:9`、`9:16`。
+- `image-edit` 模式必须传入 `--reference-image`；重复传入最多支持 10 张参考图。
+- 脚本不再使用 `enable_model_cpu_offload()`，也不会让 transformer 和 VAE 常驻 CUDA；所有组件都会按块 offload 到磁盘。
+- offload 目录默认在模型目录旁的 `.qwen-image2-offload/`，也可用环境变量 `QWEN_IMAGE2_OFFLOAD_DIR` 指定。
+- 该模式比常驻或整组件 offload 慢，但能同时缓解 22GiB GPU 和 24GiB CPU RAM 的限制。
+- `--model` 只接受本地模型目录，默认为 `models/Qwen-Image-2.1`；如模型在其他位置，请显式传入路径。
+
 ## 项目结构
 
 ```text
@@ -242,6 +287,7 @@ models/stable-diffusion-v1-5/
 models/Qwen-Image-2512/
 sd15_model.py            SD1.5 CPU 推理入口
 qwen-image-2512.py        Qwen-Image CPU 磁盘流式推理入口
+qwen-image2.py           Qwen-Image-2.1 远程 GPU 推理入口
 .venv/                   本项目虚拟环境
 ```
 
